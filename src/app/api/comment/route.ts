@@ -36,7 +36,6 @@ const personalityPrompts: Record<string, string> = {
                    - Your tone is technical and focused on hard data and efficiency.`
 };
 
-
 export async function POST(request: Request) {
   try {
     const { code, personality } = await request.json();
@@ -45,20 +44,23 @@ export async function POST(request: Request) {
         return new Response(JSON.stringify({ error: 'Missing code or personality' }), { status: 400 });
     }
 
-    
-    const fullPrompt = `
-You are a code analysis API. Your response MUST be a raw, valid JSON object and nothing else. Do not include any explanations, introductory text, or markdown fences like \`\`\`.
+    // More restrictive limits for production
+    if (code.length > 3000) {
+        return new Response(JSON.stringify({ error: 'Code snippet too long. Please limit to 3000 characters.' }), { status: 400 });
+    }
 
-Analyze the following code snippet based on this personality: "${personalityPrompts[personality]}".
+    // Add basic validation
+    if (typeof code !== 'string' || typeof personality !== 'string') {
+        return new Response(JSON.stringify({ error: 'Invalid input format' }), { status: 400 });
+    }
 
-The JSON object you return must have two keys:
-1. "language": A string with the detected language name (e.g., "javascript").
-2. "commentedCode": A single JSON string containing the final, commented code. Ensure all special characters, quotes, and newlines within this string are properly escaped.
+    const fullPrompt = `Return ONLY valid JSON with this exact structure:
+{"language": "javascript", "commentedCode": "your commented code here"}
 
-Here is the code snippet:
-\`\`\`
+Add ${personality} style comments to this code:
 ${code}
-\`\`\``;
+
+CRITICAL: Ensure the commentedCode value is a properly escaped JSON string.`;
 
     const API_KEY = process.env.GEMINI_API_KEY;
     if (!API_KEY) {
@@ -67,17 +69,18 @@ ${code}
 
     const genAI = new GoogleGenerativeAI(API_KEY);
     
-    const model = genAI.getGenerativeModel({
-        model: MODEL_NAME,
-        generationConfig: { responseMimeType: "application/json" }
-    });
-
-    const generationConfig = {
-      temperature: 0.7,
+    
+const model = genAI.getGenerativeModel({
+    model: MODEL_NAME,
+    generationConfig: { 
+      responseMimeType: "application/json",
+      temperature: 0.1,        // Reduced from 0.3 for faster, more deterministic responses
       topK: 1,
-      topP: 1,
-      maxOutputTokens: 2048,
-    };
+      topP: 0.95,              // Increased from 0.8 for better quality
+      maxOutputTokens: 800,    // Reduced from 1024 for faster response
+    }
+});
+// ...existing code...
 
     const safetySettings = [
       { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
@@ -88,38 +91,102 @@ ${code}
 
     const result = await model.generateContent({
         contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
-        generationConfig,
         safetySettings,
     });
 
     const responseText = result.response.text();
-
     
-    const startIndex = responseText.indexOf('{');
-    const endIndex = responseText.lastIndexOf('}');
-    
-    if (startIndex === -1 || endIndex === -1) {
-        throw new Error("Could not find a valid JSON object in the AI's response.");
+    // More robust JSON extraction with sanitization
+    let parsedJson;
+    try {
+      // Try parsing the entire response first
+      parsedJson = JSON.parse(responseText);
+    } catch (firstError) {
+      try {
+        // Fallback to substring method with sanitization
+        const startIndex = responseText.indexOf('{');
+        const endIndex = responseText.lastIndexOf('}');
+        
+        if (startIndex === -1 || endIndex === -1) {
+          throw new Error("Could not find a valid JSON object in the AI's response.");
+        }
+        
+        let jsonString = responseText.substring(startIndex, endIndex + 1);
+        
+        // Sanitize the JSON string to fix common escape issues
+        jsonString = sanitizeJsonString(jsonString);
+        
+        parsedJson = JSON.parse(jsonString);
+      } catch (secondError) {
+        console.error("Both JSON parsing attempts failed:", firstError, secondError);
+        throw new Error("AI returned malformed JSON response");
+      }
     }
-    
-    const jsonString = responseText.substring(startIndex, endIndex + 1);
-console.log("--- RAW STRING FROM AI THAT IS CAUSING THE CRASH ---");
-    console.log(jsonString);
-    
-    const parsedJson = JSON.parse(jsonString);
-    const sanitizedJsonString = JSON.stringify(parsedJson);
 
-    return new Response(sanitizedJsonString, {
+    // Validate response structure
+    if (!parsedJson || typeof parsedJson !== 'object' || !parsedJson.commentedCode) {
+      throw new Error("Invalid response structure from AI service");
+    }
+
+    return new Response(JSON.stringify(parsedJson), {
         status: 200,
         headers: { 'Content-Type': 'application/json' }
     });
 
   } catch (error) {
-    console.error(error);
-   
-    if (error instanceof Error) {
-        console.error("Error details:", error.message);
+    // Don't log sensitive info in production
+    if (process.env.NODE_ENV !== 'production') {
+      console.error("API Error:", error);
     }
-    return new Response(JSON.stringify({ error: 'An error occurred while processing your request.' }), { status: 500 });
+    
+    if (error instanceof Error) {
+      if (error.message.includes('503') || error.message.includes('overloaded')) {
+        return new Response(JSON.stringify({ 
+          error: 'AI service is temporarily overloaded. Please try again in a few moments.' 
+        }), { status: 503 });
+      }
+      
+      if (error.message.includes('JSON') || error.message.includes('malformed')) {
+        return new Response(JSON.stringify({ 
+          error: 'AI returned invalid response format. Please try again.' 
+        }), { status: 502 });
+      }
+    }
+    
+    return new Response(JSON.stringify({ 
+      error: 'An error occurred while processing your request. Please try again.' 
+    }), { status: 500 });
   }
+}
+
+// Helper function to sanitize JSON strings - compatible with older JS targets
+function sanitizeJsonString(jsonString: string): string {
+  let sanitized = jsonString;
+  
+  // Use a more compatible regex approach without the 's' flag
+  const lines = sanitized.split('\n');
+  const rejoinedString = lines.join('\n');
+  
+  // Find the commentedCode section more robustly
+  const commentedCodeRegex = /"commentedCode":\s*"([^"]*(?:\\.[^"]*)*)"/g;
+  const match = commentedCodeRegex.exec(rejoinedString);
+  
+  if (match) {
+    const originalValue = match[1];
+    
+    // Fix escape sequences step by step
+    const fixedValue = originalValue
+      .replace(/\\/g, '\\\\') // Escape all backslashes first
+      .replace(/"/g, '\\"')   // Then escape all quotes
+      .replace(/\n/g, '\\n')  // Then escape newlines
+      .replace(/\t/g, '\\t')  // Then escape tabs
+      .replace(/\r/g, '\\r'); // Then escape carriage returns
+    
+    sanitized = sanitized.replace(
+      /"commentedCode":\s*"[^"]*(?:\\.[^"]*)*"/g,
+      `"commentedCode": "${fixedValue}"`
+    );
+  }
+  
+  return sanitized;
 }
