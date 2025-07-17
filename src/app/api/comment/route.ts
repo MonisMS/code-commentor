@@ -1,6 +1,6 @@
 import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from "@google/generative-ai";
 
-const MODEL_NAME = "gemini-1.5-pro";
+const MODEL_NAME = "gemini-1.5-flash";
 
 const rateLimiter = new Map<string, { count: number; resetTime: number }>();
 const RATE_LIMIT = 10; 
@@ -26,7 +26,6 @@ function checkRateLimit(ip: string): { allowed: boolean; remaining: number; rese
   const userLimit = rateLimiter.get(ip);
   
   if (!userLimit || now > userLimit.resetTime) {
-   
     rateLimiter.set(ip, { count: 1, resetTime: now + WINDOW_MS });
     return { allowed: true, remaining: RATE_LIMIT - 1, resetTime: now + WINDOW_MS };
   }
@@ -75,7 +74,6 @@ const personalityPrompts: Record<string, string> = {
 
 export async function POST(request: Request) {
   try {
-   
     const ip = getRealIP(request);
     const rateCheck = checkRateLimit(ip);
     
@@ -100,23 +98,21 @@ export async function POST(request: Request) {
         return new Response(JSON.stringify({ error: 'Missing code or personality' }), { status: 400 });
     }
 
-    
     if (code.length > 3000) {
         return new Response(JSON.stringify({ error: 'Code snippet too long. Please limit to 3000 characters.' }), { status: 400 });
     }
-
 
     if (typeof code !== 'string' || typeof personality !== 'string') {
         return new Response(JSON.stringify({ error: 'Invalid input format' }), { status: 400 });
     }
 
-    const fullPrompt = `Return ONLY valid JSON with this exact structure:
-{"language": "javascript", "commentedCode": "your commented code here"}
+    const fullPrompt = `You are an expert code analyst. Return ONLY valid JSON:
+{"language": "detected_language", "commentedCode": "commented_code_here"}
 
-Add ${personality} style comments to this code:
+Add ${personalityPrompts[personality]} style comments to this code:
 ${code}
 
-CRITICAL: Ensure the commentedCode value is a properly escaped JSON string.`;
+Requirements: Detect language automatically, add inline comments, proper JSON escaping.`;
 
     const API_KEY = process.env.GEMINI_API_KEY;
     if (!API_KEY) {
@@ -125,18 +121,16 @@ CRITICAL: Ensure the commentedCode value is a properly escaped JSON string.`;
 
     const genAI = new GoogleGenerativeAI(API_KEY);
     
-    
-const model = genAI.getGenerativeModel({
-    model: "gemini-1.5-pro",
-    generationConfig: { 
-      responseMimeType: "application/json",
-      temperature: 0.2,        // Slightly higher for more creative comments
-      topK: 40,               // More diverse responses
-      topP: 0.95,             
-      maxOutputTokens: 1000,  // Can handle longer responses
-    }
-});
-
+    const model = genAI.getGenerativeModel({
+        model: "gemini-1.5-flash",
+        generationConfig: { 
+          responseMimeType: "application/json",
+          temperature: 0.1,
+          topK: 1,
+          topP: 0.95,
+          maxOutputTokens: 800,
+        }
+    });
 
     const safetySettings = [
       { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
@@ -146,12 +140,12 @@ const model = genAI.getGenerativeModel({
     ];
 
     const result = await model.generateContent({
-        contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
-        safetySettings,
+      contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
+      safetySettings,
     });
 
     const responseText = result.response.text();
-    
+
     let parsedJson;
     try {
       parsedJson = JSON.parse(responseText);
@@ -164,18 +158,15 @@ const model = genAI.getGenerativeModel({
           throw new Error("Could not find a valid JSON object in the AI's response.");
         }
         
-        let jsonString = responseText.substring(startIndex, endIndex + 1);
-        
-        jsonString = sanitizeJsonString(jsonString);
-        
+        const jsonString = responseText.substring(startIndex, endIndex + 1);
         parsedJson = JSON.parse(jsonString);
       } catch (secondError) {
         console.error("Both JSON parsing attempts failed:", firstError, secondError);
+        console.error("Response text:", responseText);
         throw new Error("AI returned malformed JSON response");
       }
     }
 
-    // Validate response structure
     if (!parsedJson || typeof parsedJson !== 'object' || !parsedJson.commentedCode) {
       throw new Error("Invalid response structure from AI service");
     }
@@ -191,12 +182,17 @@ const model = genAI.getGenerativeModel({
     });
 
   } catch (error) {
-    // Don't log sensitive info in production
     if (process.env.NODE_ENV !== 'production') {
       console.error("API Error:", error);
     }
     
     if (error instanceof Error) {
+      if (error.message.includes('429') || error.message.includes('quota')) {
+        return new Response(JSON.stringify({ 
+          error: 'API quota exceeded. Please try again later.' 
+        }), { status: 429 });
+      }
+      
       if (error.message.includes('503') || error.message.includes('overloaded')) {
         return new Response(JSON.stringify({ 
           error: 'AI service is temporarily overloaded. Please try again in a few moments.' 
@@ -214,32 +210,4 @@ const model = genAI.getGenerativeModel({
       error: 'An error occurred while processing your request. Please try again.' 
     }), { status: 500 });
   }
-}
-
-function sanitizeJsonString(jsonString: string): string {
-  let sanitized = jsonString;
-  
-  const lines = sanitized.split('\n');
-  const rejoinedString = lines.join('\n');
-  
-  const commentedCodeRegex = /"commentedCode":\s*"([^"]*(?:\\.[^"]*)*)"/g;
-  const match = commentedCodeRegex.exec(rejoinedString);
-  
-  if (match) {
-    const originalValue = match[1];
-    
-    const fixedValue = originalValue
-      .replace(/\\/g, '\\\\') 
-      .replace(/"/g, '\\"')   
-      .replace(/\n/g, '\\n')  
-      .replace(/\t/g, '\\t') 
-      .replace(/\r/g, '\\r'); 
-    
-    sanitized = sanitized.replace(
-      /"commentedCode":\s*"[^"]*(?:\\.[^"]*)*"/g,
-      `"commentedCode": "${fixedValue}"`
-    );
-  }
-  
-  return sanitized;
 }
