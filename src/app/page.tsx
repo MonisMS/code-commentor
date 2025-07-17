@@ -4,15 +4,13 @@ import { useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { atomDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 
-import { FaTwitter } from "react-icons/fa";
-
 export default function HomePage() {
   const [code, setCode] = useState("");
   const [personality, setPersonality] = useState("mentor");
   const [language, setLanguage] = useState("plaintext");
 ;
 
-  // ...existing code...
+ 
 const [result, setResult] = useState(
   "// Your commented code will appear here..."
 );
@@ -20,12 +18,12 @@ const [isLoading, setIsLoading] = useState(false);
 const [loadingMessage, setLoadingMessage] = useState("");
 const [copySuccess, setCopySuccess] = useState(false);
 
-// Fixed copy functionality
+
 const copyToClipboard = async () => {
   try {
     await navigator.clipboard.writeText(result);
     setCopySuccess(true);
-    setTimeout(() => setCopySuccess(false), 2000); // Reset after 2 seconds
+    setTimeout(() => setCopySuccess(false), 2000); 
   } catch (err) {
     console.error('Failed to copy: ', err);
     // Fallback for older browsers
@@ -40,7 +38,7 @@ const copyToClipboard = async () => {
   }
 };
 
-// ...existing code...
+
 const handleSubmit = async () => {
   setIsLoading(true);
   setLanguage("plaintext");
@@ -66,6 +64,14 @@ const handleSubmit = async () => {
     if (!response.ok) {
       const errorData = await response.json().catch(() => null);
       const statusText = response.statusText || "Unknown Error";
+      
+      
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After');
+        const minutes = retryAfter ? Math.ceil(parseInt(retryAfter) / 60) : 15;
+        throw new Error(`Rate limit exceeded. Please try again in ${minutes} minutes.`);
+      }
+      
       throw new Error(
         errorData?.error ||
           `Request failed with status: ${response.status} ${statusText}`
@@ -73,17 +79,23 @@ const handleSubmit = async () => {
     }
 
     const data = await response.json();
-    console.log("API Response:", data); // Debug log to see what's actually returned
+    console.log("API Response:", data); 
+    
+    
+    const remaining = response.headers.get('X-RateLimit-Remaining');
+    if (remaining && parseInt(remaining) <= 3) {
+      console.log(`Rate limit warning: ${remaining} requests remaining`);
+    }
 
-    // Handle malformed JSON response from AI
+    
     let commentedCode;
     if (data.commentedCode) {
-      // Fix the malformed response by replacing literal \n with actual newlines
+      
       commentedCode = data.commentedCode
-        .replace(/\\n/g, '\n')    // Replace literal \n with actual newlines
-        .replace(/\\t/g, '\t')    // Replace literal \t with actual tabs
-        .replace(/\\"/g, '"')     // Replace literal \" with actual quotes
-        .replace(/\\\\/g, '\\');  // Replace literal \\ with actual backslashes
+        .replace(/\\n/g, '\n')    
+        .replace(/\\t/g, '\t')    
+        .replace(/\\"/g, '"')     
+        .replace(/\\\\/g, '\\');  
     } else if (data.code) {
       commentedCode = data.code;
     } else if (typeof data === 'string') {
@@ -92,7 +104,7 @@ const handleSubmit = async () => {
       throw new Error("No commented code returned from API");
     }
 
-    // More robust language detection
+    
     const detectedLang = data.language ? data.language.toLowerCase() : "plaintext";
 
     setResult(commentedCode);
@@ -103,6 +115,8 @@ const handleSubmit = async () => {
       if (error.name === "AbortError") {
         errorMessage =
           "Request timed out after 60 seconds. Please try again with a shorter code snippet.";
+      } else if (error.message.includes("Rate limit exceeded")) {
+        errorMessage = error.message;
       } else if (error.message.includes("Failed to fetch")) {
         errorMessage =
           "Network error. Please check your connection and try again.";
@@ -117,7 +131,7 @@ const handleSubmit = async () => {
     setLoadingMessage("");
   }
 };
-// ...existing code...
+
   return (
  <main className="flex min-h-screen flex-col items-center bg-gray-900 text-white p-4 sm:p-12">
     <div className="w-full max-w-4xl flex-grow flex flex-col">
@@ -203,7 +217,7 @@ const handleSubmit = async () => {
             <p className="text-gray-400">
               Made with ❤️ by{" "}
               <a
-                href="https://github.com/MonisMS"
+                href="https://x.com/SMSarwar47"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-blue-400 hover:underline"
@@ -211,14 +225,6 @@ const handleSubmit = async () => {
                 Monis
               </a>
             </p>
-            <a
-              href="https://x.com/SMSarwar47"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-gray-400 hover:text-white"
-            >
-              <FaTwitter size={20} />
-            </a>
           </div>
         </footer>
       </div>

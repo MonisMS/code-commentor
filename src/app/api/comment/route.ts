@@ -2,6 +2,43 @@ import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from "@google/ge
 
 const MODEL_NAME = "gemini-1.5-flash";
 
+const rateLimiter = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT = 10; 
+const WINDOW_MS = 15 * 60 * 1000; 
+
+function getRealIP(request: Request): string {
+  const forwarded = request.headers.get('x-forwarded-for');
+  const realIP = request.headers.get('x-real-ip');
+  
+  if (forwarded) {
+    return forwarded.split(',')[0].trim();
+  }
+  
+  if (realIP) {
+    return realIP;
+  }
+  
+  return 'unknown';
+}
+
+function checkRateLimit(ip: string): { allowed: boolean; remaining: number; resetTime: number } {
+  const now = Date.now();
+  const userLimit = rateLimiter.get(ip);
+  
+  if (!userLimit || now > userLimit.resetTime) {
+   
+    rateLimiter.set(ip, { count: 1, resetTime: now + WINDOW_MS });
+    return { allowed: true, remaining: RATE_LIMIT - 1, resetTime: now + WINDOW_MS };
+  }
+  
+  if (userLimit.count >= RATE_LIMIT) {
+    return { allowed: false, remaining: 0, resetTime: userLimit.resetTime };
+  }
+  
+  userLimit.count++;
+  return { allowed: true, remaining: RATE_LIMIT - userLimit.count, resetTime: userLimit.resetTime };
+}
+
 const personalityPrompts: Record<string, string> = {
     'mentor': `You are an encouraging and experienced software development mentor reviewing a code snippet. Your goal is to help the user understand their code and feel confident.
               - Your tone is positive, supportive, and educational.
@@ -38,18 +75,37 @@ const personalityPrompts: Record<string, string> = {
 
 export async function POST(request: Request) {
   try {
+   
+    const ip = getRealIP(request);
+    const rateCheck = checkRateLimit(ip);
+    
+    if (!rateCheck.allowed) {
+      const resetTimeSeconds = Math.ceil((rateCheck.resetTime - Date.now()) / 1000);
+      return new Response(JSON.stringify({ 
+        error: `Rate limit exceeded. Try again in ${Math.ceil(resetTimeSeconds / 60)} minutes.` 
+      }), { 
+        status: 429,
+        headers: {
+          'X-RateLimit-Limit': RATE_LIMIT.toString(),
+          'X-RateLimit-Remaining': '0',
+          'X-RateLimit-Reset': rateCheck.resetTime.toString(),
+          'Retry-After': resetTimeSeconds.toString()
+        }
+      });
+    }
+
     const { code, personality } = await request.json();
 
     if (!code || !personality) {
         return new Response(JSON.stringify({ error: 'Missing code or personality' }), { status: 400 });
     }
 
-    // More restrictive limits for production
+    
     if (code.length > 3000) {
         return new Response(JSON.stringify({ error: 'Code snippet too long. Please limit to 3000 characters.' }), { status: 400 });
     }
 
-    // Add basic validation
+
     if (typeof code !== 'string' || typeof personality !== 'string') {
         return new Response(JSON.stringify({ error: 'Invalid input format' }), { status: 400 });
     }
@@ -74,13 +130,13 @@ const model = genAI.getGenerativeModel({
     model: MODEL_NAME,
     generationConfig: { 
       responseMimeType: "application/json",
-      temperature: 0.1,        // Reduced from 0.3 for faster, more deterministic responses
+      temperature: 0.1,        
       topK: 1,
-      topP: 0.95,              // Increased from 0.8 for better quality
-      maxOutputTokens: 800,    // Reduced from 1024 for faster response
+      topP: 0.95,             
+      maxOutputTokens: 800,    
     }
 });
-// ...existing code...
+
 
     const safetySettings = [
       { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
@@ -96,14 +152,11 @@ const model = genAI.getGenerativeModel({
 
     const responseText = result.response.text();
     
-    // More robust JSON extraction with sanitization
     let parsedJson;
     try {
-      // Try parsing the entire response first
       parsedJson = JSON.parse(responseText);
     } catch (firstError) {
       try {
-        // Fallback to substring method with sanitization
         const startIndex = responseText.indexOf('{');
         const endIndex = responseText.lastIndexOf('}');
         
@@ -113,7 +166,6 @@ const model = genAI.getGenerativeModel({
         
         let jsonString = responseText.substring(startIndex, endIndex + 1);
         
-        // Sanitize the JSON string to fix common escape issues
         jsonString = sanitizeJsonString(jsonString);
         
         parsedJson = JSON.parse(jsonString);
@@ -130,7 +182,12 @@ const model = genAI.getGenerativeModel({
 
     return new Response(JSON.stringify(parsedJson), {
         status: 200,
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-RateLimit-Limit': RATE_LIMIT.toString(),
+          'X-RateLimit-Remaining': rateCheck.remaining.toString(),
+          'X-RateLimit-Reset': rateCheck.resetTime.toString()
+        }
     });
 
   } catch (error) {
@@ -159,28 +216,24 @@ const model = genAI.getGenerativeModel({
   }
 }
 
-// Helper function to sanitize JSON strings - compatible with older JS targets
 function sanitizeJsonString(jsonString: string): string {
   let sanitized = jsonString;
   
-  // Use a more compatible regex approach without the 's' flag
   const lines = sanitized.split('\n');
   const rejoinedString = lines.join('\n');
   
-  // Find the commentedCode section more robustly
   const commentedCodeRegex = /"commentedCode":\s*"([^"]*(?:\\.[^"]*)*)"/g;
   const match = commentedCodeRegex.exec(rejoinedString);
   
   if (match) {
     const originalValue = match[1];
     
-    // Fix escape sequences step by step
     const fixedValue = originalValue
-      .replace(/\\/g, '\\\\') // Escape all backslashes first
-      .replace(/"/g, '\\"')   // Then escape all quotes
-      .replace(/\n/g, '\\n')  // Then escape newlines
-      .replace(/\t/g, '\\t')  // Then escape tabs
-      .replace(/\r/g, '\\r'); // Then escape carriage returns
+      .replace(/\\/g, '\\\\') 
+      .replace(/"/g, '\\"')   
+      .replace(/\n/g, '\\n')  
+      .replace(/\t/g, '\\t') 
+      .replace(/\r/g, '\\r'); 
     
     sanitized = sanitized.replace(
       /"commentedCode":\s*"[^"]*(?:\\.[^"]*)*"/g,
